@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Jinja Referral Network Analyzer</title>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+    <style>
+        body { margin: 0; font-family: Arial, sans-serif; }
+        #controls { padding: 8px; background: #f5f5f5; border-bottom: 1px solid #ccc; }
+        #map { height: calc(100vh - 50px); }
+        #hcivSelect { min-width: 220px; padding: 4px; }
+        .custom-div-icon {
+            background: transparent;
+            border: none;
+            text-align: center;
+            font-size: 26px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.6);
+            color: #000; /* BLACK crosses permanently */
+        }
+    </style>
+</head>
+<body>
+<div id="controls">
+    <label for="hcivSelect"><b>Select Health Center:</b></label>
+    <select id="hcivSelect">
+        <option value="">-- Choose HCIV --</option>
+        <option value="buwenge">Buwenge HCIV</option>
+        <option value="walukuba">Walukuba HCIV</option>
+        <option value="budondo">Budondo HCIV</option>
+        <option value="mpumudde">Mpumudde HCIV</option>
+        <option value="bugembe">Bugembe HCIV</option>
+    </select>
+</div>
+<div id="map"></div>
+
+<script>
+    // ---------------- Basic data ----------------
+    const jrrh = [0.431111, 33.205000];
+    const hcivs = {
+        buwenge:  [0.65229, 33.16965],
+        walukuba: [0.43824, 33.22508],
+        budondo:  [0.51725, 33.16165],
+        mpumudde: [0.45993, 33.21235],
+        bugembe:  [0.46433, 33.23708]
+    };
+    const hcivNames = {
+        buwenge:  'Buwenge HCIV',
+        budondo:  'Budondo HCIV',
+        mpumudde: 'Mpumudde HCIV',
+        bugembe:  'Bugembe HCIV',
+        walukuba: 'Walukuba HCIV'
+    };
+
+    // Referral times from your analysis
+    const referralTimes = {
+        buwenge: { car: 30, foot: 450 },
+        walukuba: { car: 5, foot: 70 },
+        budondo: { car: 14, foot: 200 },
+        mpumudde: { car: 12, foot: 100 },
+        bugembe: { car: 9, foot: 130 }
+    };
+
+    // ---------------- Map init ----------------
+    const map = L.map('map').setView([0.45, 33.20], 11);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // JRRH marker (permanent, red hospital icon)
+    const jrrhMarker = L.marker(jrrh, {
+        icon: L.divIcon({
+            className: 'custom-div-icon',
+            html: '🏥',
+            iconSize: [30, 30],
+            iconAnchor: [14, 30],
+            style: 'color: #DC143C; font-size: 28px;'
+        })
+    }).addTo(map).bindPopup('🏥 Jinja Regional Referral Hospital (JRRH)');
+
+    // HCIV markers (all black crosses permanently)
+    const hcivMarkers = {};
+    Object.entries(hcivs).forEach(([key, coord]) => {
+        const label = hcivNames[key];
+        const m = L.marker(coord, {
+            icon: L.divIcon({
+                className: 'custom-div-icon',
+                html: '✚',
+                iconSize: [24, 24],
+                iconAnchor: [12, 24],
+                style: 'color: #000000; font-size: 26px;'  // black crosses permanently
+            })
+        }).addTo(map).bindPopup(`✚ ${label}`);
+        hcivMarkers[key] = m;
+    });
+
+    // ---------------- GraphHopper routing ----------------
+    const API_KEY = '6feeb3a1-2f8e-4318-b461-594af3cd394a';
+    function getRoute(profile, start, end) {
+        const url = 'https://graphhopper.com/api/1/route' +
+            `?point=${start[0]},${start[1]}` +
+            `&point=${end[0]},${end[1]}` +
+            `&profile=${profile}` +
+            '&points_encoded=false' +
+            `&key=${API_KEY}`;
+        return fetch(url)
+            .then(r => r.json())
+            .then(data => {
+                if (!data.paths || !data.paths.length) {
+                    throw new Error(data.message || 'No route found');
+                }
+                const path = data.paths[0];
+                const coords = path.points.coordinates.map(c => [c[1], c[0]]);
+                const distanceKm = (path.distance / 1000).toFixed(1);
+                return { profile, coords, distanceKm };
+            });
+    }
+
+    // Storage for current routes and selected HCIV
+    let currentRoutes = [];
+
+    function clearRoutes() {
+        currentRoutes.forEach(l => map.removeLayer(l));
+        currentRoutes = [];
+    }
+
+    // ---------------- Interactive HCIV selection ----------------
+    const selectEl = document.getElementById('hcivSelect');
+    selectEl.addEventListener('change', () => {
+        clearRoutes();
+        const key = selectEl.value;
+        if (!key) return;
+
+        const start = hcivs[key];
+        const label = hcivNames[key];
+        const times = referralTimes[key];
+        const carTime = times.car;
+        const footTime = times.foot;
+        const bestProfile = carTime <= footTime ? 'car' : 'foot';
+        const altProfile = bestProfile === 'car' ? 'foot' : 'car';
+        const bestRefTime = Math.min(carTime, footTime);
+        const altRefTime = Math.max(carTime, footTime);
+
+        // Zoom to show both facilities
+        const group = L.featureGroup([hcivMarkers[key], jrrhMarker]);
+        map.fitBounds(group.getBounds().pad(0.3));
+
+        Promise.all([
+            getRoute('foot', start, jrrh),
+            getRoute('car', start, jrrh)
+        ])
+        .then(results => {
+            const footRoute = results[0];
+            const carRoute = results[1];
+            const bestRoute = bestProfile === 'car' ? carRoute : footRoute;
+            const altRoute = bestProfile === 'car' ? footRoute : carRoute;
+
+            const bestLine = L.polyline(bestRoute.coords, {
+                color: 'red',
+                weight: 6
+            }).addTo(map)
+              .bindPopup(
+                  `✚ ${label} → 🏥 JRRH<br>` +
+                  `Most effective: ${bestProfile}<br>` +
+                  `Referral time: ${bestRefTime} min<br>` +
+                  `${bestRoute.distanceKm} km`
+              ).openPopup();
+
+            const altLine = L.polyline(altRoute.coords, {
+                color: 'blue',
+                weight: 4,
+                dashArray: '8,8'
+            }).addTo(map)
+              .bindPopup(
+                  `✚ ${label} → 🏥 JRRH<br>` +
+                  `Alternative: ${altProfile}<br>` +
+                  `Referral time: ${altRefTime} min<br>` +
+                  `${altRoute.distanceKm} km`
+              );
+
+            currentRoutes.push(bestLine, altLine);
+        })
+        .catch(err => {
+            console.error('Routing error for', key, err);
+            alert('Could not get route for ' + label);
+        });
+    });
+
+    // ---------------- FULL Jinja District highlight ----------------
+    fetch('https://nominatim.openstreetmap.org/search.php?q=Jinja+District%2C+Uganda&polygon_geojson=1&format=jsonv2')
+        .then(res => res.json())
+        .then(results => {
+            const district = results.find(f =>
+                (f.display_name || '').toLowerCase().includes('district')
+            ) || results.find(f =>
+                (f.display_name || '').toLowerCase().includes('jinja')
+            ) || results[0];
+
+            if (district?.geojson) {
+                const boundaryLayer = L.geoJSON(district.geojson, {
+                    style: {
+                        color: '#FF4500',      // Orange outline
+                        weight: 4,
+                        fillColor: '#FFA07A',  // Light orange fill
+                        fillOpacity: 0.15
+                    }
+                }).addTo(map);
+            }
+        })
+        .catch(err => console.error('District boundary fetch error', err));
+
+    // ---------------- LEGEND ----------------
+    const legend = L.control({ position: 'bottomright' });
+    legend.onAdd = function (map) {
+        const div = L.DomUtil.create('div', 'info legend');
+        div.style.background = 'rgba(255, 255, 255, 0.95)';
+        div.style.padding = '12px 16px';
+        div.style.font = 'bold 14px Arial, sans-serif';
+        div.style.boxShadow = '0 4px 16px rgba(0,0,0,0.25)';
+        div.style.borderRadius = '10px';
+        div.style.border = '2px solid rgba(255,69,0,0.3)';
+        div.style.textAlign = 'left';
+
+        div.innerHTML = `
+            <div style="font-size:18px; font-weight:bold; color:#333; margin-bottom:16px; text-align:center; border-bottom:2px solid #FF4500; padding-bottom:8px;">
+                LEGEND
+            </div>
+
+            <div style="margin:10px 0;">
+                <span style="color:#000000; font-size:20px; font-weight:bold;">✚</span>
+                <span style="margin-left:10px; font-weight:bold;">HCIVs (Health Centers)</span>
+            </div>
+
+            <div style="margin:10px 0;">
+                <span style="color:#DC143C; font-size:22px;">🏥</span>
+                <span style="margin-left:10px; font-weight:bold;">Jinja Regional Referral Hospital</span>
+            </div>
+
+            <div style="margin-top:16px; padding-top:12px; border-top:2px solid #ddd;">
+                <div style="margin:8px 0; font-weight:bold;">
+                    <span style="display:inline-block; width:28px; height:6px; background:#FF0000; border-radius:3px; margin-right:10px;"></span>
+                    Most Effective Route (Red)
+                </div>
+                <div style="margin:8px 0; font-weight:bold;">
+                    <span style="display:inline-block; width:28px; height:4px; border-top:4px dashed #0066CC; margin-right:10px;"></span>
+                    Alternative Route (Blue Dashed)
+                </div>
+            </div>
+        `;
+        return div;
+    };
+    legend.addTo(map);
+</script>
+</body>
+</html>
+
+
